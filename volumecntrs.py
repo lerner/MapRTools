@@ -23,7 +23,8 @@
 #   2017 Oct 11 Resolved IP output into hostname and sort output on hostname
 #               Check MapR Version and set ActiveServers key to IP:Port or IP as appropriate
 #   2017 Oct 16 Fix for hostnames greater than 16 characters
-#   2017 Oct 20 Correctly handle nodes with multiple IP addresses.  Use IP address in output if hostname not resolvable.
+#   2020 Jan 16 Handle multiple networks, Append ecstore container info if any EC volumes specified.
+
 
 import sys
 import subprocess
@@ -62,10 +63,17 @@ def getNodeInfo():
   nodeInfoJson=json.loads(nodeInfo)
   return nodeInfoJson
 
+# This should have been getVolumeDumpInfo, but leaving it
 def getVolumeInfo(volumename):
   volumeInfo, errout = execCmd(["/opt/mapr/bin/maprcli", "dump", "volumeinfo", "-volumename", volumename, "-json"])
   volumeInfoJson=json.loads(volumeInfo)
   return volumeInfoJson
+
+# Adding getVolumeInfo2, for what should be getVolumeInfo, for erasure coding info
+def getVolumeInfo2(volumename):
+  volumeInfo, errout = execCmd(["/opt/mapr/bin/maprcli", "volume", "info", "-name", volumename, "-json"])
+  volumeInfo2Json=json.loads(volumeInfo)
+  return volumeInfo2Json
 
 def isValidInfoJson(InfoJson):
   # region info JSON should always have a status
@@ -77,12 +85,13 @@ def isValidInfoJson(InfoJson):
     desc = InfoJson["errors"][0]["desc"]
   return status, desc
 
-def container_fmt(container, isMaster=False, isValid=True):
+def container_fmt(container, isMaster=False, isValid=True, isEcStore=False):
   rs=""
-  if isMaster:
-    rs+="'"
-  if not isValid:
-    rs+="*"
+  if not isEcStore:
+    if isMaster:
+      rs+="'"
+    if not isValid:
+      rs+="*"
   rs+=str(container)
   return rs
 
@@ -91,10 +100,7 @@ def print_containers():
   for instance in instanceList:
     ip=instance[:instance.find(':')]
     port=instance[instance.find(':')+1:]
-    try:
-      host=socket.gethostbyaddr(ip)[0]
-    except:
-      host=ip
+    host=socket.gethostbyaddr(ip)[0]
     instanceContainerLine = host + ':' + port + " :: "
     # print instance + " ::",
     # removed later indented comments below
@@ -154,22 +160,10 @@ def print_heatmap(containerType):
       print str(numPortContainers[port]).rjust(5),
     print str(clusterTotal).rjust(6)
 
-def main():
+def getGlobalInfo():
+  global clusterInfoJson
+  global nodeInfoJson
 
-  if len(sys.argv) != 2:
-    usage()
-  
-  # volumename=sys.argv[1]
-  # Comma separated list of volumes
-  volumes=sys.argv[1]
-
-  '''
-  volumeInfoJson = getVolumeInfo(volumename)
-  status, description = isValidInfoJson(volumeInfoJson)
-  if status != "OK":
-    usage(description)
-  '''
-    
   clusterInfoJson = getClusterInfo()
   status, description = isValidInfoJson(clusterInfoJson)
   if status != "OK":
@@ -180,6 +174,76 @@ def main():
   if status != "OK":
     usage(description)
 
+def resetCounts():
+  global ipAddrList
+  global portList
+  global nodeContainers
+  global instanceList
+  global volumeContainers 
+  global maprMajorVersion
+  
+  instanceList = []
+  ipAddrList = []
+  portList = []
+  #volumeContainerDict = defaultdict(list)
+  volumeContainers = defaultdict(list)
+  containerCount = {"masterCnt":0, "replicaCnt":0, "totalCnt":0, "ecstoreCnt":0}
+  portContainers = defaultdict(list)
+
+  nodeContainers = defaultdict(list)
+  '''
+  nodeContainers["node"]["port"]["masterCnt"]
+  nodeContainers["node"]["port"]["replicaCnt"]
+  nodeContainers["node"]["port"]["totalCnt"]
+  '''
+  
+  maprMajorVersion=clusterInfoJson["data"][0]["version"][0]
+  startPort=5660
+  maxInstances=1
+  for nodeDict in nodeInfoJson["data"]:
+    maxInstances=max(maxInstances, int(nodeDict["numInstances"]))
+  
+  portList = range(startPort, startPort+maxInstances)
+
+  for port in portList:
+    portContainers[str(port)]=containerCount.copy()
+
+  for nodeDict in nodeInfoJson["data"]:
+    nodeIpAddrTmp = nodeDict["ip"]
+    # if a node has multiple IP addresses (list instead of str), use first address
+    # This logic originally assumed that the first IP address listed here is also the first IP address
+    # listed for containers in maprcli dump volumeinfo when there are multiple networks:
+    #                   "Master":"172.18.0.111:5660-172.19.0.111:5660--3-VALID",
+    # 			"ActiveServers":{
+    # 				"IP":[
+    # 					"172.18.0.111:5660-172.19.0.111:5660--3-VALID",
+    # 					"172.18.0.109:5663-172.19.0.109:5663--3-VALID",
+    # 					"172.18.0.106:5660-172.19.0.106:5660--3-VALID"
+    # I parse based on the first hyphen and use that IP address as the index into nodeContainers
+    # for keeping track of container counts
+    #
+    # Turns out this is not always the case.  Changed logic to sort the list of addresses and then 
+    # use the first one.  This works for my multiple docker network environment, but I don't know if
+    # the IP's listed in maprcli dump volumeinfo are always in this sort order.  If not, it's likely
+    # you'll see an error when you try to increment the count for a container into nodeContainers and the
+    # node (ip) index does not exist.
+    # You'll see something like 
+    #   File "./volumecntrs.py", line 325, in getVolumeCntrInfo
+    #     nodeContainers[node][port]["replicaCnt"]+=1
+    # TypeError: list indices must be integers, not unicode
+		
+    if isinstance(nodeIpAddrTmp, (str, unicode)):
+      nodeIpAddr=nodeIpAddrTmp
+    else:
+      nodeIpAddrTmp.sort()  # Here's the sort to get lexically lowest IP address
+      nodeIpAddr=nodeIpAddrTmp[0]
+    #print type(nodeIpAddr)
+    ipAddrList.append(nodeIpAddr)
+    nodeContainers[nodeIpAddr]=deepcopy(portContainers)
+  ipAddrList.sort()
+
+def getVolumeCntrInfo(volumeList,isEcStore=False):
+  global maprMajorVersion
   # Create a volume container dictionary
   #   Key	: Instance
   #   Value	: List of Container Dicts
@@ -198,104 +262,74 @@ def main():
           "10.10.99.65:5666--3-VALID"
         ]
       },
-      "InactiveServers":{
-        
-      },
-      "UnusedServers":{
-        
-      },
-      "OwnedSizeMB":"2 MB",
-      "SharedSizeMB":"0 MB",
-      "LogicalSizeMB":"2 MB",
-      "TotalSizeMB":"3 MB",
-      "NumInodesInUse":111,
-      "Mtime":"Tue Aug 23 16:53:18 PDT 2016",
-      "NameContainer":"true",
-      "CreatorContainerId":3034,
-      "CreatorVolumeUuid":"-5904192217364639182:-865739949170454469",
-      "UseActualCreatorId":true
+      ...
     }
-  '''
 
-  global ipAddrList
-  global portList
-  global nodeContainers
-  global instanceList
-  global volumeContainers 
+  For ecstore volumes (set isEcStore=True), global volume info also in first entry.
+  Subsequent entry for each Container Group which has global CG info.
+  Each CG entry has an ECGContainers dict containing keys cid0 through cid[data+parity-1], each
+  of which has container Id and location info (where Master always equals the only IP entry)
   
-  instanceList = []
-  ipAddrList = []
-  portList = []
-  volumeContainerDict = defaultdict(list)
-  volumeContainers = defaultdict(list)
-  containerCount = {"masterCnt":0, "replicaCnt":0, "totalCnt":0}
-  portContainers = defaultdict(list)
-
-  nodeContainers = defaultdict(list)
   '''
-  nodeContainers["node"]["port"]["masterCnt"]
-  nodeContainers["node"]["port"]["replicaCnt"]
-  nodeContainers["node"]["port"]["totalCnt"]
-  '''
-  
-  maprMajorVersion=clusterInfoJson["data"][0]["version"][0]
-  startPort=5660
-  maxInstances=1
-  for nodeDict in nodeInfoJson["data"]:
-    if nodeDict["numInstances"].isdigit():
-      maxInstances=max(maxInstances, int(nodeDict["numInstances"]))
-  
-  portList = range(startPort, startPort+maxInstances)
-
-  for port in portList:
-    portContainers[str(port)]=containerCount.copy()
-
-  for nodeDict in nodeInfoJson["data"]:
-    nodeIpAddr = nodeDict["ip"]
-    # get just one IP address if node has multiple
-    # Use an IP address that resolves to a hostname if possible
-    if type(nodeIpAddr) is list:
-      for ip in nodeIpAddr:
-        try:
-          host=socket.gethostbyaddr(ip)[0]
-          break
-        except:
-          continue
-      del nodeIpAddr
-      nodeIpAddr=ip
-    ipAddrList.append(nodeIpAddr)
-    nodeContainers[nodeIpAddr]=deepcopy(portContainers)
-  ipAddrList.sort()
-
   containerList=[]
-  volumeList=volumes.split(",")
-  print "Gather container information for volumes:"
+  # volumeList=volumes.split(",")
+  if isEcStore:
+    print ""
+    print "Gather Erasure Code Storage (ecstore) container information for volumes:"
+  else:
+    print "Gather container information for volumes:"
   for volumename in volumeList:
-    print "  ", volumename
+    print "  ",volumename
+    if isEcStore:
+      print "     Group   Containers"
     volumeInfoJson = getVolumeInfo(volumename)
     status, description = isValidInfoJson(volumeInfoJson)
     if status != "OK":
       usage(description)
     #containerList=volumeInfoJson["data"]
     volContainerList=volumeInfoJson["data"]
-    containerList.extend(volContainerList[1:])
+    if isEcStore:
+      for volCG in volContainerList[1:]:
+	print ("     "+str(volCG["ContainerGroupId"])+" ::"),
+        for volCid in volCG["ECGContainers"]:
+	  #print (volCid)
+	  #print (volCG["ECGContainers"][volCid])
+	  #print type(volCG["ECGContainers"][volCid])
+	  print (str(volCG["ECGContainers"][volCid]["ContainerId"])),
+	  containerList.append(volCG["ECGContainers"][volCid])
+        print ""
+    else:
+      containerList.extend(volContainerList[1:])
+
+    # For EC, get volume info2 and add backing store ec volume to ecvolume list
+    volumeInfo2Json = getVolumeInfo2(volumename)
+    status, description = isValidInfoJson(volumeInfoJson)
+    if status != "OK":
+      usage(description)
+    if "ecstorevolume" in volumeInfo2Json["data"][0]:
+      ecvolumeList.append(volumeInfo2Json["data"][0]["ecstorevolume"])
   print ""
 
   #for containerDict in containerList[1:]:  # Skip to container entries for Dict
   for containerDict in containerList:  
+    #print type(containerDict)
     # Add Master Container to corresponding instance list
     mInstance=containerDict["Master"]
     mInstance=mInstance[:mInstance.find('-')]
     node=mInstance[:mInstance.find(':')]
     port=mInstance[mInstance.find(':')+1:]
     # print node, port
-    nodeContainers[node][port]["masterCnt"]+=1
-    nodeContainers[node][port]["totalCnt"]+=1
+    #print json.dumps(nodeContainers)
+    if isEcStore:
+      nodeContainers[node][port]["ecstoreCnt"]+=1
+    else:
+      nodeContainers[node][port]["masterCnt"]+=1
+      nodeContainers[node][port]["totalCnt"]+=1
     isMaster=True
     isValid=True # TBD extract Valid from instance
     containerId=containerDict["ContainerId"]
     #volumeContainerDict[mInstance].append(containerDict)
-    volumeContainers[mInstance].append(container_fmt(containerId, isMaster, isValid))
+    volumeContainers[mInstance].append(container_fmt(containerId, isMaster, isValid, isEcStore))
     if mInstance not in instanceList:
       instanceList.append(mInstance)
     # Add additional replicas to corresponding instance lists
@@ -324,10 +358,14 @@ def main():
         continue
       node=rInstance[:rInstance.find(':')]
       port=rInstance[rInstance.find(':')+1:]
+      #print node,type(node)
+      #print port,type(port)
+      #print type(nodeContainers)
       nodeContainers[node][port]["replicaCnt"]+=1
       nodeContainers[node][port]["totalCnt"]+=1
 
-      volumeContainers[rInstance].append(container_fmt(containerId, isMaster, isValid))
+      #print type(volumeContainers)
+      volumeContainers[rInstance].append(container_fmt(containerId, isMaster, isValid, isEcStore))
       if rInstance not in instanceList:
         instanceList.append(rInstance)
       
@@ -335,13 +373,39 @@ def main():
 
   print_containers()
 
-  for countType in ["masterCnt","replicaCnt","totalCnt"]:
+  if isEcStore: # No replicas for ECG containers.  Every container is a "master".
     print ""
-    print_heatmap(countType)
+    print_heatmap("ecstoreCnt")
+  else:
+    for countType in ["masterCnt","replicaCnt","totalCnt"]:
+      print ""
+      print_heatmap(countType)
 
+def main():
+
+  if len(sys.argv) != 2:
+    usage()
+  
+  # volumename=sys.argv[1]
+  # Comma separated list of volumes
+  global volumes
+  volumes=sys.argv[1]
+  
+  getGlobalInfo()
+  resetCounts()
+
+  global volumeList
+  global ecvolumeList
+  ecvolumeList=[]
+  volumeList=volumes.split(",")
+  getVolumeCntrInfo(volumeList)
+  
+  # Now add getting and printing ecVolumeCntrInfo here if there were any EC volumes in original volumeList
+  if ecvolumeList:
+    resetCounts()
+    getVolumeCntrInfo(ecvolumeList,True)
 
 if __name__ == "__main__":
    main()
 
 exit(0)
-
